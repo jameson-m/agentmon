@@ -68,16 +68,9 @@ Not counted: the Claude desktop app (it's listed with the other apps), installs 
 
 CPU per row is a share of one core, so a busy build can pass 100%; the totals are a share of all cores. Press `?` in the app for the rest.
 
-## Development
+## Contributing
 
-```sh
-cargo test
-cargo clippy --all-targets
-scripts/build-linux.sh    # static Linux binaries into dist/
-scripts/screenshot.py    # docs/screenshot.png from --demo; needs tmux and Chrome
-```
-
-Tagging `v*` builds the binaries and publishes a release.
+Issues and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md) for how to build, test and what a good report or change looks like.
 
 ## License
 
