@@ -37,7 +37,10 @@ On macOS, GPU load, power, temperature and fan speed come from [macmon](https://
 agentmon              # refreshes every 2 seconds
 agentmon -i 1000      # every second (250 at the fastest)
 agentmon --demo       # invented data, to see what it looks like
+agentmon --update     # replace it with the latest release
 ```
+
+`--update` is for installs made with the script; with Homebrew use `brew upgrade agentmon`. agentmon never checks for updates on its own.
 
 | Key | Action |
 | --- | --- |

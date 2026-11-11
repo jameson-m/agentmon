@@ -32,9 +32,11 @@ const USAGE: &str = "\
 agentmon: system monitor for Claude Code sessions
 
 Usage: agentmon [-i <ms>] [--demo]
+       agentmon --update
 
   -i, --interval <ms>  Refresh interval, at least 250 [default: 2000]
       --demo           Show invented data instead of this machine's
+      --update         Replace this binary with the latest release
   -h, --help           Show this help
   -V, --version        Show version";
 
@@ -51,6 +53,7 @@ static SAVED_TERMIOS: OnceLock<libc::termios> = OnceLock::new();
 enum Cli {
     Run { interval: Duration, demo: bool },
     Exit(String),
+    Update,
 }
 
 fn parse_args(args: &[String]) -> Result<Cli, String> {
@@ -69,6 +72,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                 }
             }
             "--demo" => demo = true,
+            "--update" => return Ok(Cli::Update),
             "-h" | "--help" => return Ok(Cli::Exit(USAGE.into())),
             "-V" | "--version" => {
                 return Ok(Cli::Exit(format!("agentmon {}", env!("CARGO_PKG_VERSION"))));
@@ -80,6 +84,69 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         interval: Duration::from_millis(interval),
         demo,
     })
+}
+
+const REPO: &str = "https://github.com/jameson-m/agentmon";
+const INSTALLER: &str = "https://raw.githubusercontent.com/jameson-m/agentmon/main/install.sh";
+
+/// `1.2.3` from the address the latest release redirects to.
+fn version_from_url(url: &str) -> Option<&str> {
+    let version = url.trim().rsplit_once("/tag/v")?.1;
+    (!version.is_empty()).then_some(version)
+}
+
+/// Whether dotted version `latest` is ahead of `current`.
+fn newer(latest: &str, current: &str) -> bool {
+    let parts = |v: &str| -> Vec<u64> { v.split('.').map(|p| p.parse().unwrap_or(0)).collect() };
+    parts(latest) > parts(current)
+}
+
+/// Updates in place by running the release installer into this binary's own
+/// folder. Nothing is fetched unless this is asked for.
+fn update() -> Result<String, String> {
+    let current = env!("CARGO_PKG_VERSION");
+    let exe = std::env::current_exe()
+        .and_then(|path| path.canonicalize())
+        .map_err(|e| format!("can't find this binary: {e}"))?;
+    let path = exe.to_string_lossy();
+    if ["/Cellar/", "/homebrew/", "/linuxbrew/"]
+        .iter()
+        .any(|dir| path.contains(dir))
+    {
+        return Ok("installed with Homebrew: run `brew upgrade agentmon`".into());
+    }
+    let latest = format!("{REPO}/releases/latest");
+    let probe = std::process::Command::new("curl")
+        .args([
+            "-fsSLI",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{url_effective}",
+            &latest,
+        ])
+        .output()
+        .map_err(|_| "curl is needed to update".to_string())?;
+    let url = String::from_utf8_lossy(&probe.stdout);
+    let latest = version_from_url(&url).ok_or("couldn't reach GitHub for the latest release")?;
+    if !newer(latest, current) {
+        return Ok(format!("agentmon {current} is up to date"));
+    }
+    let dir = exe.parent().ok_or("this binary has no folder")?;
+    println!("agentmon {current} -> {latest}");
+    let done = std::process::Command::new("sh")
+        .args(["-c", &format!("curl -fsSL {INSTALLER} | sh")])
+        .env("AGENTMON_BIN", dir)
+        .status()
+        .map_err(|e| format!("couldn't run the installer: {e}"))?;
+    if done.success() {
+        Ok(String::new())
+    } else {
+        Err(format!(
+            "the installer failed; is {} writable?",
+            dir.display()
+        ))
+    }
 }
 
 fn restore_terminal() {
@@ -378,6 +445,18 @@ fn main() {
             println!("{text}");
             return;
         }
+        Ok(Cli::Update) => match update() {
+            Ok(text) => {
+                if !text.is_empty() {
+                    println!("{text}");
+                }
+                return;
+            }
+            Err(message) => {
+                eprintln!("agentmon: {message}");
+                std::process::exit(1);
+            }
+        },
         Err(message) => {
             eprintln!("agentmon: {message}");
             std::process::exit(2);
@@ -404,6 +483,18 @@ mod tests {
             interval: Duration::from_millis(ms),
             demo,
         }
+    }
+
+    #[test]
+    fn update_compares_versions() {
+        let url = "https://github.com/jameson-m/agentmon/releases/tag/v0.10.2\n";
+        assert_eq!(version_from_url(url), Some("0.10.2"));
+        assert_eq!(version_from_url("https://github.com/login"), None);
+        assert!(newer("0.10.2", "0.9.9"));
+        assert!(newer("1.0.0", "0.99.0"));
+        assert!(!newer("0.2.0", "0.2.0"));
+        assert!(!newer("0.2.0", "0.2.1"));
+        assert_eq!(parse(&["--update"]), Ok(Cli::Update));
     }
 
     #[test]
