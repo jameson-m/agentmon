@@ -4,7 +4,7 @@ A terminal system monitor for people running lots of [Claude Code](https://claud
 
 ![agentmon in a narrow pane and in a wide window](docs/screenshot.png)
 
-- **Sessions first.** Every Claude Code session with its state (● working, ◆ just finished and probably waiting on you, ○ idle), how long it has been that way, the tokens in its context, its memory and its CPU history. Press Enter to see the process tree under it.
+- **Sessions first.** Every Claude Code session with its state (● working, ◆ just finished and probably waiting on you, ○ idle), how long it has been that way, the tokens in its context, its memory and its CPU history. Press Enter to see the process tree under it, or `x` to stop the session and everything it started.
 - **Fits a side pane.** Works from about 40 columns, and rearranges itself into two columns from 110.
 - **Readable at a glance.** Every core with its own history, memory pressure that turns the whole box amber or red, and colours that hold up on light and dark terminals.
 - **No sudo, no daemon.** One small binary. macOS on Apple Silicon and Linux (x86_64, arm64).
@@ -41,8 +41,11 @@ agentmon --demo       # invented data, to see what it looks like
 
 | Key | Action |
 | --- | --- |
-| `↑` `↓` or `j` `k` | select a session |
-| `Enter` | show or hide its process tree |
+| `↑` `↓` or `j` `k` | select a row |
+| `Tab` | switch between sessions and processes |
+| `Enter` | show or hide a session's process tree |
+| `/` | filter both lists by name |
+| `x` | kill the selected session or app, after a `y` (`X` to force) |
 | `s` | sort by memory or CPU |
 | `?` | help, including what every figure means |
 | `q` | quit |

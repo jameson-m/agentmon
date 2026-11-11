@@ -12,10 +12,39 @@ pub const SESSION_HISTORY: usize = 32;
 const ACTIVE_CPU: u8 = 5;
 const ACTIVE_WINDOW: usize = 3;
 
+/// Which list the keys act on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Focus {
+    #[default]
+    Sessions,
+    Procs,
+}
+
+/// A kill waiting for a yes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Kill {
+    pub label: String,
+    pub pids: Vec<i32>,
+    /// SIGKILL rather than SIGTERM.
+    pub force: bool,
+}
+
 #[derive(Default)]
 pub struct App {
     pub sort: SortKey,
     pub help: bool,
+    /// Lines the help is scrolled down by.
+    pub help_scroll: u16,
+    pub focus: Focus,
+    /// Shows only rows whose name contains this, whatever the case.
+    pub filter: String,
+    /// The filter is being typed.
+    pub filtering: bool,
+    pub confirm: Option<Kill>,
+    /// The outcome of the last action, until the next key.
+    pub notice: Option<String>,
+    /// The data is invented, so there is nothing to signal.
+    pub read_only: bool,
     pub memory: Memory,
     pub cpu: CpuUsage,
     /// None once the source is missing, dead or stale.
@@ -44,6 +73,32 @@ pub struct App {
     selected_index: usize,
     pub expanded: HashSet<i32>,
     pub scroll: usize,
+    /// Lowest pid of the selected process row.
+    pub proc_selected: Option<i32>,
+    proc_index: usize,
+    pub proc_scroll: usize,
+}
+
+/// Keeps `selected` while it's still shown; otherwise whatever now sits where
+/// it was.
+fn follow(shown: &[i32], selected: Option<i32>, index: usize) -> (Option<i32>, usize) {
+    match shown.iter().position(|&pid| Some(pid) == selected) {
+        Some(at) => (selected, at),
+        None => {
+            let at = index.min(shown.len().saturating_sub(1));
+            (shown.get(at).copied(), at)
+        }
+    }
+}
+
+/// One step up or down a list, stopping at its ends.
+fn step(shown: &[i32], index: usize, down: bool) -> (Option<i32>, usize) {
+    let at = if down {
+        (index + 1).min(shown.len().saturating_sub(1))
+    } else {
+        index.saturating_sub(1)
+    };
+    (shown.get(at).copied(), at)
 }
 
 /// One line of the sessions list.
@@ -162,15 +217,81 @@ impl App {
         sessions::sort_rows(&mut self.grouped.others, self.sort);
     }
 
-    /// Follows the selected pid through re-sorts; if it exited, keeps the slot.
-    fn sync_selection(&mut self) {
-        let list = &self.grouped.sessions;
-        if let Some(i) = list.iter().position(|s| Some(s.pid) == self.selected) {
-            self.selected_index = i;
-        } else {
-            self.selected_index = self.selected_index.min(list.len().saturating_sub(1));
-            self.selected = list.get(self.selected_index).map(|s| s.pid);
+    fn matches(&self, name: &str) -> bool {
+        self.filter.is_empty() || name.to_lowercase().contains(&self.filter.to_lowercase())
+    }
+
+    /// Indices of the sessions the filter lets through.
+    pub fn shown_sessions(&self) -> Vec<usize> {
+        let sessions = self.grouped.sessions.iter().enumerate();
+        sessions
+            .filter(|(_, s)| self.matches(&s.name))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Indices of the process rows the filter lets through.
+    pub fn shown_procs(&self) -> Vec<usize> {
+        let rows = self.grouped.others.iter().enumerate();
+        rows.filter(|(_, r)| self.matches(&r.name))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn session_pids(&self) -> Vec<i32> {
+        let shown = self.shown_sessions();
+        shown
+            .iter()
+            .map(|&i| self.grouped.sessions[i].pid)
+            .collect()
+    }
+
+    fn proc_pids(&self) -> Vec<i32> {
+        let shown = self.shown_procs();
+        shown.iter().map(|&i| self.grouped.others[i].pid).collect()
+    }
+
+    /// Follows each selection through re-sorts and filtering; if its row has
+    /// gone, keeps the slot.
+    pub fn sync_selection(&mut self) {
+        let shown = self.session_pids();
+        (self.selected, self.selected_index) = follow(&shown, self.selected, self.selected_index);
+        let shown = self.proc_pids();
+        (self.proc_selected, self.proc_index) = follow(&shown, self.proc_selected, self.proc_index);
+    }
+
+    pub fn toggle_focus(&mut self) {
+        self.focus = match self.focus {
+            Focus::Sessions => Focus::Procs,
+            Focus::Procs => Focus::Sessions,
+        };
+    }
+
+    /// Asks before signalling the selected row: a session with everything
+    /// under it, or every process of an app.
+    pub fn ask_kill(&mut self, force: bool) {
+        if self.read_only {
+            self.notice = Some("demo: nothing to kill".into());
+            return;
         }
+        self.confirm = match self.focus {
+            Focus::Sessions => self.selected.and_then(|pid| {
+                let session = self.grouped.sessions.iter().find(|s| s.pid == pid)?;
+                Some(Kill {
+                    label: session.name.clone(),
+                    pids: session.tree.iter().map(|row| row.pid).collect(),
+                    force,
+                })
+            }),
+            Focus::Procs => self.proc_selected.and_then(|pid| {
+                let row = self.grouped.others.iter().find(|r| r.pid == pid)?;
+                Some(Kill {
+                    label: row.name.to_string(),
+                    pids: row.pids.clone(),
+                    force,
+                })
+            }),
+        };
     }
 
     pub fn cycle_sort(&mut self) {
@@ -180,20 +301,26 @@ impl App {
     }
 
     pub fn move_selection(&mut self, down: bool) {
-        let len = self.grouped.sessions.len();
-        if len == 0 {
-            return;
+        match self.focus {
+            Focus::Sessions => {
+                let shown = self.session_pids();
+                (self.selected, self.selected_index) = step(&shown, self.selected_index, down);
+            }
+            Focus::Procs => {
+                let shown = self.proc_pids();
+                (self.proc_selected, self.proc_index) = step(&shown, self.proc_index, down);
+            }
         }
-        self.selected_index = if down {
-            (self.selected_index + 1).min(len - 1)
-        } else {
-            self.selected_index.saturating_sub(1)
-        };
-        self.selected = Some(self.grouped.sessions[self.selected_index].pid);
+    }
+
+    /// Index of the selected row among the shown process rows.
+    pub fn proc_index(&self) -> usize {
+        self.proc_index
     }
 
     pub fn toggle_expanded(&mut self) {
-        if let Some(pid) = self.selected
+        if self.focus == Focus::Sessions
+            && let Some(pid) = self.selected
             && !self.expanded.remove(&pid)
         {
             self.expanded.insert(pid);
@@ -202,7 +329,8 @@ impl App {
 
     pub fn session_lines(&self) -> Vec<SessionLine> {
         let mut lines = Vec::new();
-        for (i, session) in self.grouped.sessions.iter().enumerate() {
+        for i in self.shown_sessions() {
+            let session = &self.grouped.sessions[i];
             lines.push(SessionLine::Session(i));
             if self.expanded.contains(&session.pid) {
                 lines.extend((0..session.tree.len()).map(|row| SessionLine::Tree(i, row)));
@@ -219,7 +347,7 @@ impl App {
             let session = match line {
                 SessionLine::Session(i) | SessionLine::Tree(i, _) => *i,
             };
-            if session == self.selected_index {
+            if Some(self.grouped.sessions[session].pid) == self.selected {
                 if matches!(line, SessionLine::Session(_)) {
                     first = at;
                 }
@@ -337,6 +465,42 @@ mod tests {
             0,
         );
         assert!(a.expanded.is_empty());
+    }
+
+    #[test]
+    fn filter_narrows_both_lists_and_selection_follows() {
+        let mut a = app(&[(10, 5), (20, 3)]);
+        label_sessions(&mut a.grouped.sessions, |pid| {
+            Some(if pid == 10 { "/a/Web" } else { "/a/api" }.into())
+        });
+        a.filter = "API".into();
+        a.sync_selection();
+        assert_eq!(a.shown_sessions().len(), 1);
+        assert_eq!(a.selected, Some(20));
+        assert_eq!(a.session_lines().len(), 1);
+        a.filter = "nothing".into();
+        a.sync_selection();
+        assert_eq!(a.selected, None);
+        a.filter.clear();
+        a.sync_selection();
+        assert_eq!(a.shown_sessions().len(), 2);
+        assert!(a.selected.is_some());
+    }
+
+    #[test]
+    fn kill_targets_the_focused_row_and_all_its_processes() {
+        let mut a = app(&[(10, 5), (20, 3)]);
+        a.ask_kill(false);
+        let kill = a.confirm.take().unwrap();
+        assert_eq!((kill.pids, kill.force), (vec![10, 11], false));
+        // The process list has nothing in it here, so nothing to ask about.
+        a.toggle_focus();
+        a.ask_kill(true);
+        assert_eq!(a.confirm, None);
+        a.read_only = true;
+        a.toggle_focus();
+        a.ask_kill(false);
+        assert_eq!(a.confirm, None);
     }
 
     #[test]

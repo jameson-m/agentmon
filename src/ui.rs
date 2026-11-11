@@ -1,6 +1,6 @@
 //! Rendering: boxed panels in the manner of btop. Colours come from `palette`
 //! and text stays in the terminal's default foreground, so it reads on any theme.
-use crate::app::{self, App, SessionLine};
+use crate::app::{self, App, Focus, SessionLine};
 use crate::charts::{self, Ramp, Segment, segment};
 use crate::claude;
 use crate::palette;
@@ -72,8 +72,12 @@ const MIN_PANEL: u16 = 3;
 pub const HELP: &str = "\
 q        quit
 s        cycle sort: mem, cpu
-↑↓ j k   select session
-Enter    expand process tree
+↑↓ j k   select a row
+Tab      switch between sessions and processes
+Enter    expand a session's process tree
+/        filter both lists by name; Enter keeps it, Esc clears it
+x        kill the selected row, after a y: a session with everything under it,
+         or every process of an app. X forces it (SIGKILL)
 ?        this help
 
 cpu: overall load in the title. The graph is the first cluster's history, with the last cluster's mirrored below. Beside it, the total, then every core with its own history; in a small panel, each cluster instead, with one bar per core, where 100% = all of those cores. Green under 60, amber under 85, then red. With macmon, or on Linux whatever sensors the machine has: GPU load, whole-system power and CPU temperature with their history, then power by part, GPU temperature and fan speed.
@@ -409,15 +413,18 @@ fn border_label(buf: &mut Buffer, y: u16, end: u16, min: u16, line: &Line) -> bo
     }
 }
 
-const HINTS: [(&str, &str); 5] = [
+const HINTS: [(&str, &str); 8] = [
     ("↑↓", "select"),
+    ("⇥", "list"),
     ("⏎", "tree"),
+    ("/", "filter"),
+    ("x", "kill"),
     ("s", "sort"),
     ("?", "help"),
     ("q", "quit"),
 ];
 /// Which hints to keep as the border narrows, most wanted first.
-const HINT_PRIORITY: [usize; 5] = [3, 4, 2, 1, 0];
+const HINT_PRIORITY: [usize; 8] = [6, 7, 3, 4, 5, 1, 2, 0];
 
 /// As many key hints as fit in `width`, in reading order.
 fn hints(width: u16) -> Line<'static> {
@@ -443,11 +450,43 @@ fn hints(width: u16) -> Line<'static> {
     Line::from(spans)
 }
 
-fn draw_hints(buf: &mut Buffer, rect: Rect) {
+/// The bottom border: a question waiting for an answer, the filter being
+/// typed, what the last action did, or else the keys.
+fn draw_hints(buf: &mut Buffer, rect: Rect, app: &App) {
     if rect.height < 2 || rect.width < 8 {
         return;
     }
-    let line = hints(rect.width - 6);
+    let width = rect.width - 6;
+    let line = if let Some(kill) = &app.confirm {
+        let signal = if kill.force { "force kill" } else { "kill" };
+        let count = match kill.pids.len() {
+            1 => String::new(),
+            n => format!(" and its {n} processes"),
+        };
+        Line::from(vec![
+            Span::styled(
+                format!("{signal} {}{count}?", kill.label),
+                BOLD.fg(palette::WARN),
+            ),
+            Span::styled(" y", BOLD),
+            Span::styled(" yes", DIM),
+        ])
+    } else if app.filtering {
+        Line::from(vec![
+            Span::styled(format!("/{}▏", app.filter), BOLD),
+            Span::styled(" ⏎ keep  esc clear", DIM),
+        ])
+    } else if let Some(notice) = &app.notice {
+        Line::styled(notice.clone(), BOLD)
+    } else if !app.filter.is_empty() {
+        let shown = format!("/{}", app.filter);
+        let rest = width.saturating_sub(shown.chars().count() as u16 + 2);
+        let mut spans = vec![Span::styled(shown, BOLD.fg(palette::WARN)), Span::raw("  ")];
+        spans.extend(hints(rest).spans);
+        Line::from(spans)
+    } else {
+        hints(width)
+    };
     border_text(buf, rect.x + 2, rect.bottom() - 1, rect.right() - 1, &line);
 }
 
@@ -1145,10 +1184,13 @@ fn draw_sessions(buf: &mut Buffer, rect: Rect, app: &mut App, with_hints: bool) 
 
     let app = &*app;
     let sessions = &app.grouped.sessions;
-    let mut title = vec![
-        Span::styled("sessions", BOLD),
-        Span::raw(format!(" {}", sessions.len())),
-    ];
+    let shown = app.shown_sessions().len();
+    let count = if shown == sessions.len() {
+        format!(" {shown}")
+    } else {
+        format!(" {shown}/{}", sessions.len())
+    };
+    let mut title = vec![Span::styled("sessions", BOLD), Span::raw(count)];
     if lines.len() > viewport && viewport > 0 {
         let end = (app.scroll + viewport).min(lines.len());
         let range = format!(" {}-{}/{}", app.scroll + 1, end, lines.len());
@@ -1161,12 +1203,17 @@ fn draw_sessions(buf: &mut Buffer, rect: Rect, app: &mut App, with_hints: bool) 
     }
     list_header(buf, rect, &title, app.sort, true);
     if with_hints {
-        draw_hints(buf, rect);
+        draw_hints(buf, rect, app);
     }
 
-    if sessions.is_empty() {
+    if lines.is_empty() {
+        let text = if sessions.is_empty() {
+            "no claude sessions"
+        } else {
+            "no session matches the filter"
+        };
         let width = area.width.saturating_sub(2) as usize;
-        buf.set_stringn(area.x + 2, area.y, "no claude sessions", width, DIM);
+        buf.set_stringn(area.x + 2, area.y, text, width, DIM);
     }
     let largest = sessions.iter().map(|s| s.mem).max().unwrap_or(1).max(1) as f64;
     for (line, y) in lines.iter().skip(app.scroll).zip(area.y..area.bottom()) {
@@ -1175,7 +1222,7 @@ fn draw_sessions(buf: &mut Buffer, rect: Rect, app: &mut App, with_hints: bool) 
                 let s = &sessions[i];
                 let color = session_color(app, s.pid);
                 let history = app.session_history.get(&s.pid);
-                let selected = app.selected == Some(s.pid);
+                let selected = app.selected == Some(s.pid) && app.focus == Focus::Sessions;
                 let state = session_state(app, s.pid);
                 // Without word from Claude Code, go by recent CPU.
                 let look = match state {
@@ -1247,8 +1294,18 @@ fn draw_sessions(buf: &mut Buffer, rect: Rect, app: &mut App, with_hints: bool) 
     }
 }
 
-fn draw_procs(buf: &mut Buffer, rect: Rect, app: &App, with_hints: bool) {
+fn draw_procs(buf: &mut Buffer, rect: Rect, app: &mut App, with_hints: bool) {
+    let shown = app.shown_procs();
+    let viewport = rect.height.saturating_sub(2) as usize;
+    let at = app.proc_index();
+    app.proc_scroll = app::scroll_offset(app.proc_scroll, at, at, viewport, shown.len());
+
+    let app = &*app;
     let mut title = vec![Span::styled("processes", BOLD)];
+    if shown.len() < app.grouped.others.len() {
+        let count = format!(" {}/{}", shown.len(), app.grouped.others.len());
+        title.push(Span::raw(count));
+    }
     if app.grouped.unreadable > 0 {
         title.push(Span::styled(
             format!(" {} n/a", app.grouped.unreadable),
@@ -1262,7 +1319,7 @@ fn draw_procs(buf: &mut Buffer, rect: Rect, app: &App, with_hints: bool) {
     }
     list_header(buf, rect, &title, app.sort, false);
     if with_hints {
-        draw_hints(buf, rect);
+        draw_hints(buf, rect, app);
     }
     let by_mem = others_by_mem(app);
     let largest = by_mem.first().map_or(1, |r| r.mem).max(1) as f64;
@@ -1274,12 +1331,14 @@ fn draw_procs(buf: &mut Buffer, rect: Rect, app: &App, with_hints: bool) {
             .find(|(r, _)| r.pid == pid)
             .map_or(palette::OTHER, |(_, c)| c)
     };
-    for (row, y) in app.grouped.others.iter().zip(area.y..area.bottom()) {
+    let rows = shown.iter().map(|&i| &app.grouped.others[i]);
+    for (row, y) in rows.skip(app.proc_scroll).zip(area.y..area.bottom()) {
         let name = if row.count > 1 {
             format!("{} ×{}", row.name, row.count)
         } else {
             row.name.to_string()
         };
+        let selected = app.proc_selected == Some(row.pid) && app.focus == Focus::Procs;
         draw_row(
             buf,
             area,
@@ -1290,7 +1349,11 @@ fn draw_procs(buf: &mut Buffer, rect: Rect, app: &App, with_hints: bool) {
                 age: None,
                 ctx: None,
                 name: &name,
-                name_style: Style::new(),
+                name_style: if selected {
+                    BOLD.add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::new()
+                },
                 fill: row.mem as f64 / largest,
                 bar_color: color(row.pid),
                 mem: fmt_mem(row.mem),
@@ -1303,7 +1366,7 @@ fn draw_procs(buf: &mut Buffer, rect: Rect, app: &App, with_hints: bool) {
     }
 }
 
-fn draw_help(buf: &mut Buffer, rect: Rect) {
+fn draw_help(buf: &mut Buffer, rect: Rect, app: &mut App) {
     let inner = frame(
         buf,
         rect,
@@ -1314,7 +1377,9 @@ fn draw_help(buf: &mut Buffer, rect: Rect) {
         return;
     }
     let close = Line::from(vec![
-        Span::styled("any key", BOLD),
+        Span::styled("↑↓", BOLD),
+        Span::styled(" scroll  ", DIM),
+        Span::styled("any other key", BOLD),
         Span::styled(" back", DIM),
     ]);
     border_text(buf, rect.x + 2, rect.bottom() - 1, rect.right() - 1, &close);
@@ -1323,8 +1388,17 @@ fn draw_help(buf: &mut Buffer, rect: Rect) {
         width: inner.width.saturating_sub(2),
         ..inner
     };
+    // Roughly how many rows the wrapped text takes, to stop at its end.
+    let width = usize::from(text.width.max(1));
+    let rows: usize = HELP
+        .lines()
+        .map(|line| line.chars().count().div_ceil(width).max(1))
+        .sum();
+    let last = rows.saturating_sub(usize::from(text.height)) as u16 + 2;
+    app.help_scroll = app.help_scroll.min(last);
     Paragraph::new(HELP)
         .wrap(Wrap { trim: false })
+        .scroll((app.help_scroll, 0))
         .render(text, buf);
 }
 
@@ -1335,7 +1409,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     let buf = frame.buffer_mut();
     if app.help {
-        draw_help(buf, area);
+        draw_help(buf, area, app);
         return;
     }
     let most = u16::MAX as usize / 2;
@@ -1539,7 +1613,11 @@ mod tests {
     fn hints_drop_the_least_needed_first() {
         assert_eq!(
             hints(60).to_string(),
-            "↑↓ select  ⏎ tree  s sort  ? help  q quit"
+            "⇥ list  ⏎ tree  / filter  x kill  s sort  ? help  q quit"
+        );
+        assert_eq!(
+            hints(70).to_string(),
+            "↑↓ select  ⇥ list  ⏎ tree  / filter  x kill  s sort  ? help  q quit"
         );
         assert_eq!(hints(20).to_string(), "? help  q quit");
         assert_eq!(hints(3).to_string(), "");
@@ -1869,6 +1947,11 @@ mod tests {
         let mut app = sample_app(0);
         app.help = true;
         let text = render(&mut app, 60, 40).join("\n");
-        assert!(text.contains("phys_footprint"));
+        assert!(text.contains("cycle sort") && text.contains("↑↓ scroll"));
+        // The rest is a scroll away, and the scroll stops at the end.
+        app.help_scroll = u16::MAX;
+        let text = render(&mut app, 60, 40).join("\n");
+        assert!(text.contains("phys_footprint") && text.contains("n/a."));
+        assert!(app.help_scroll < 60);
     }
 }

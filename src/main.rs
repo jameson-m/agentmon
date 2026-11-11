@@ -212,19 +212,84 @@ impl Collector {
     }
 }
 
+/// Signals every process of a confirmed kill, and says how it went. Never
+/// init, and never this process.
+fn kill(request: &app::Kill) -> String {
+    let signal = if request.force {
+        libc::SIGKILL
+    } else {
+        libc::SIGTERM
+    };
+    let me = std::process::id() as i32;
+    let targets = request.pids.iter().filter(|&&pid| pid > 1 && pid != me);
+    let (mut sent, mut failed) = (0, 0);
+    for &pid in targets {
+        if unsafe { libc::kill(pid, signal) } == 0 {
+            sent += 1;
+        } else {
+            failed += 1;
+        }
+    }
+    let name = if request.force { "KILL" } else { "TERM" };
+    match failed {
+        0 => format!("sent {name} to {} ({sent})", request.label),
+        _ => format!("sent {name} to {sent}, {failed} refused"),
+    }
+}
+
 /// Applies a key. Returns true to quit.
 fn on_key(app: &mut app::App, code: KeyCode, mods: KeyModifiers) -> bool {
-    if code == KeyCode::Char('q')
-        || (code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL))
-    {
+    if code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL) {
+        return true;
+    }
+    app.notice = None;
+    // A pending kill takes the next key: y goes ahead, anything else doesn't.
+    if let Some(request) = app.confirm.take() {
+        if code == KeyCode::Char('y') {
+            app.notice = Some(kill(&request));
+        }
+        return false;
+    }
+    if app.filtering {
+        match code {
+            KeyCode::Char(c) => app.filter.push(c),
+            KeyCode::Backspace => {
+                app.filter.pop();
+            }
+            KeyCode::Enter => app.filtering = false,
+            KeyCode::Esc => {
+                app.filter.clear();
+                app.filtering = false;
+            }
+            _ => {}
+        }
+        app.sync_selection();
+        return false;
+    }
+    if code == KeyCode::Char('q') {
         return true;
     }
     if app.help {
-        app.help = false;
+        match code {
+            KeyCode::Down | KeyCode::Char('j') => app.help_scroll += 1,
+            KeyCode::Up | KeyCode::Char('k') => app.help_scroll = app.help_scroll.saturating_sub(1),
+            _ => {
+                app.help = false;
+                app.help_scroll = 0;
+            }
+        }
         return false;
     }
     match code {
         KeyCode::Char('?') => app.help = true,
+        KeyCode::Char('/') => app.filtering = true,
+        KeyCode::Esc => {
+            app.filter.clear();
+            app.sync_selection();
+        }
+        KeyCode::Tab | KeyCode::BackTab => app.toggle_focus(),
+        KeyCode::Char('x') => app.ask_kill(false),
+        KeyCode::Char('X') => app.ask_kill(true),
         KeyCode::Char('s') => app.cycle_sort(),
         KeyCode::Down | KeyCode::Char('j') => app.move_selection(true),
         KeyCode::Up | KeyCode::Char('k') => app.move_selection(false),
@@ -289,7 +354,11 @@ fn start(interval: Duration, demo: bool) -> io::Result<()> {
     start_fuse();
     if demo {
         let mut demo = demo::Demo::default();
-        return run(&mut terminal, |app| demo.tick(app), interval);
+        let tick = |app: &mut app::App| {
+            app.read_only = true;
+            demo.tick(app);
+        };
+        return run(&mut terminal, tick, interval);
     }
     let mut collector = Collector {
         memory: system::MemorySampler::new(),
@@ -356,6 +425,60 @@ mod tests {
         assert!(!fuse_blown(&mut strikes, idle));
         assert!(!fuse_blown(&mut strikes, pegged));
         assert!(fuse_blown(&mut strikes, pegged));
+    }
+
+    #[test]
+    fn filter_takes_the_keys_until_it_is_closed() {
+        let mut app = app::App::default();
+        let none = KeyModifiers::NONE;
+        let press = |app: &mut app::App, code| on_key(app, code, none);
+        press(&mut app, KeyCode::Char('/'));
+        // Letters that are commands elsewhere are just text here.
+        for c in "qs?".chars() {
+            assert!(!press(&mut app, KeyCode::Char(c)));
+        }
+        assert_eq!(app.filter, "qs?");
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!((app.filter.as_str(), app.filtering), ("qs", false));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.filter.is_empty());
+        assert!(on_key(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn kill_needs_a_yes_and_ends_the_process() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let request = app::Kill {
+            label: "sleep".into(),
+            // Init and this process are never signalled, whatever is asked.
+            pids: vec![child.id() as i32, 1, std::process::id() as i32],
+            force: false,
+        };
+        let none = KeyModifiers::NONE;
+        let mut app = app::App::default();
+        app.confirm = Some(request.clone());
+        on_key(&mut app, KeyCode::Char('n'), none);
+        assert_eq!((app.confirm.clone(), app.notice.clone()), (None, None));
+        assert!(child.try_wait().unwrap().is_none());
+
+        app.confirm = Some(request);
+        on_key(&mut app, KeyCode::Char('y'), none);
+        assert_eq!(app.notice.as_deref(), Some("sent TERM to sleep (1)"));
+        assert!(!child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn demo_never_signals() {
+        let mut app = app::App::default();
+        demo::Demo::default().tick(&mut app);
+        app.read_only = true;
+        on_key(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(app.confirm, None);
+        assert!(app.notice.is_some());
     }
 
     #[test]

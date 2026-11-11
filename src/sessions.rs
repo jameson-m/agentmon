@@ -45,10 +45,13 @@ pub struct Session {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Row {
     pub name: Rc<str>,
+    /// The lowest pid in the row, which identifies it.
     pub pid: i32,
     pub mem: u64,
     pub cpu: f64,
     pub count: usize,
+    /// Every process in the row.
+    pub pids: Vec<i32>,
 }
 
 #[derive(Debug, Default)]
@@ -173,7 +176,9 @@ pub fn group(procs: &[Proc]) -> Grouped {
                 mem: 0,
                 cpu: 0.0,
                 count: 0,
+                pids: Vec::new(),
             });
+            row.pids.push(proc.pid);
             row.pid = row.pid.min(proc.pid);
             row.mem += mem;
             row.cpu += cpu;
@@ -185,6 +190,7 @@ pub fn group(procs: &[Proc]) -> Grouped {
                 mem,
                 cpu,
                 count: 1,
+                pids: vec![proc.pid],
             });
         }
     }
@@ -374,6 +380,7 @@ mod tests {
             mem,
             cpu,
             count: 1,
+            pids: vec![pid],
         };
         let mut rows = vec![row(1, 10, 5.0), row(2, 20, 1.0), row(3, 20, 2.0)];
         sort_rows(&mut rows, SortKey::Mem);
