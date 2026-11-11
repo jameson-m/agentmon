@@ -47,6 +47,7 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - run: cd dist && sha256sum agentmon-* > SHA256SUMS
       - run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --generate-notes
         env:
           GH_TOKEN: ${{ github.token }}

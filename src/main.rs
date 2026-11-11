@@ -2,6 +2,7 @@
 mod app;
 mod charts;
 mod claude;
+mod demo;
 #[cfg(target_os = "macos")]
 mod ffi;
 mod palette;
@@ -30,9 +31,10 @@ const FIRST_DELTA: Duration = Duration::from_millis(300);
 const USAGE: &str = "\
 agentmon: system monitor for Claude Code sessions
 
-Usage: agentmon [-i <ms>]
+Usage: agentmon [-i <ms>] [--demo]
 
   -i, --interval <ms>  Refresh interval, at least 250 [default: 2000]
+      --demo           Show invented data instead of this machine's
   -h, --help           Show this help
   -V, --version        Show version";
 
@@ -47,12 +49,13 @@ static SAVED_TERMIOS: OnceLock<libc::termios> = OnceLock::new();
 
 #[derive(Debug, PartialEq)]
 enum Cli {
-    Run(Duration),
+    Run { interval: Duration, demo: bool },
     Exit(String),
 }
 
 fn parse_args(args: &[String]) -> Result<Cli, String> {
     let mut interval = DEFAULT_INTERVAL_MS;
+    let mut demo = false;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -65,6 +68,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                     return Err(format!("interval must be at least {MIN_INTERVAL_MS}ms"));
                 }
             }
+            "--demo" => demo = true,
             "-h" | "--help" => return Ok(Cli::Exit(USAGE.into())),
             "-V" | "--version" => {
                 return Ok(Cli::Exit(format!("agentmon {}", env!("CARGO_PKG_VERSION"))));
@@ -72,7 +76,10 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
             other => return Err(format!("unknown argument: {other}\n\n{USAGE}")),
         }
     }
-    Ok(Cli::Run(Duration::from_millis(interval)))
+    Ok(Cli::Run {
+        interval: Duration::from_millis(interval),
+        demo,
+    })
 }
 
 fn restore_terminal() {
@@ -229,16 +236,16 @@ fn on_key(app: &mut app::App, code: KeyCode, mods: KeyModifiers) -> bool {
 
 fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    collector: &mut Collector,
+    mut tick: impl FnMut(&mut app::App),
     interval: Duration,
 ) -> io::Result<()> {
     let mut app = app::App::default();
-    collector.tick(&mut app);
+    tick(&mut app);
     let mut next_tick = Instant::now() + FIRST_DELTA.min(interval);
     let mut dirty = true;
     loop {
         if Instant::now() >= next_tick {
-            collector.tick(&mut app);
+            tick(&mut app);
             next_tick = Instant::now() + interval;
             dirty = true;
         }
@@ -265,7 +272,7 @@ fn run(
     }
 }
 
-fn start(interval: Duration) -> io::Result<()> {
+fn start(interval: Duration, demo: bool) -> io::Result<()> {
     install_handlers();
     palette::detect_truecolor();
     let mut termios = unsafe { std::mem::zeroed() };
@@ -280,6 +287,10 @@ fn start(interval: Duration) -> io::Result<()> {
     terminal.hide_cursor()?;
     terminal.clear()?;
     start_fuse();
+    if demo {
+        let mut demo = demo::Demo::default();
+        return run(&mut terminal, |app| demo.tick(app), interval);
+    }
     let mut collector = Collector {
         memory: system::MemorySampler::new(),
         cpu: system::CpuSampler::new(),
@@ -287,13 +298,13 @@ fn start(interval: Duration) -> io::Result<()> {
         sensors: sensors::Source::start(interval),
         claude: claude::Reader::new(),
     };
-    run(&mut terminal, &mut collector, interval)
+    run(&mut terminal, |app| collector.tick(app), interval)
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let interval = match parse_args(&args) {
-        Ok(Cli::Run(interval)) => interval,
+    let (interval, demo) = match parse_args(&args) {
+        Ok(Cli::Run { interval, demo }) => (interval, demo),
         Ok(Cli::Exit(text)) => {
             println!("{text}");
             return;
@@ -303,7 +314,7 @@ fn main() {
             std::process::exit(2);
         }
     };
-    if let Err(error) = start(interval) {
+    if let Err(error) = start(interval, demo) {
         restore_terminal();
         eprintln!("agentmon: {error}");
         std::process::exit(1);
@@ -319,16 +330,18 @@ mod tests {
         parse_args(&args)
     }
 
+    fn run(ms: u64, demo: bool) -> Cli {
+        Cli::Run {
+            interval: Duration::from_millis(ms),
+            demo,
+        }
+    }
+
     #[test]
     fn interval_flag() {
-        assert_eq!(
-            parse(&[]),
-            Ok(Cli::Run(Duration::from_millis(DEFAULT_INTERVAL_MS)))
-        );
-        assert_eq!(
-            parse(&["-i", "1000"]),
-            Ok(Cli::Run(Duration::from_millis(1000)))
-        );
+        assert_eq!(parse(&["--demo", "-i", "500"]), Ok(run(500, true)));
+        assert_eq!(parse(&[]), Ok(run(DEFAULT_INTERVAL_MS, false)));
+        assert_eq!(parse(&["-i", "1000"]), Ok(run(1000, false)));
         assert!(parse(&["-i"]).is_err());
         assert!(parse(&["-i", "fast"]).is_err());
         assert!(parse(&["-i", "10"]).is_err());
